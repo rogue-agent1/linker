@@ -1,175 +1,244 @@
 #!/usr/bin/env python3
-"""Linker — symbol resolution, relocation, and section merging.
+"""linker.py — Static linker simulator.
+
+Resolves symbols across object files, performs relocation, merges
+sections (.text, .data, .bss), builds a symbol table, and detects
+undefined/duplicate symbol errors. Like a minimal ld.
 
 One file. Zero deps. Does one thing well.
-
-Simulates the core linking process: parse object files, resolve symbols,
-merge sections, apply relocations. How ld/lld turn .o files into executables.
 """
+
 import sys
-from collections import defaultdict
+from dataclasses import dataclass, field
 
+
+@dataclass
 class Symbol:
-    __slots__ = ('name', 'section', 'offset', 'size', 'binding', 'defined')
-    def __init__(self, name, section="", offset=0, size=0, binding="global", defined=True):
-        self.name = name
-        self.section = section
-        self.offset = offset
-        self.size = size
-        self.binding = binding  # global, local, weak
-        self.defined = defined
-    def __repr__(self):
-        d = "DEF" if self.defined else "UND"
-        return f"{self.name}({d}, {self.section}+0x{self.offset:x})"
+    name: str
+    section: str  # '.text', '.data', '.bss', 'UNDEF', 'ABS'
+    offset: int = 0
+    size: int = 0
+    is_global: bool = True
+    defined: bool = True
+    value: int = 0  # resolved address
 
+
+@dataclass
 class Relocation:
-    __slots__ = ('offset', 'symbol', 'type', 'addend')
-    def __init__(self, offset, symbol, rtype="R_X86_64_PC32", addend=0):
-        self.offset = offset
-        self.symbol = symbol
-        self.type = rtype
-        self.addend = addend
+    offset: int         # where in section to patch
+    symbol: str         # symbol name to resolve
+    type: str = 'ABS32' # ABS32, REL32, ABS64
+    addend: int = 0
 
+
+@dataclass
 class Section:
-    __slots__ = ('name', 'data', 'align', 'flags')
-    def __init__(self, name, data=b'', align=1, flags=""):
-        self.name = name
-        self.data = data
-        self.align = align
-        self.flags = flags
+    name: str
+    data: bytearray = field(default_factory=bytearray)
+    align: int = 4
+    relocations: list[Relocation] = field(default_factory=list)
 
+
+@dataclass
 class ObjectFile:
-    def __init__(self, name):
-        self.name = name
-        self.sections = {}
-        self.symbols = []
-        self.relocations = defaultdict(list)  # section -> [Relocation]
+    name: str
+    sections: dict[str, Section] = field(default_factory=dict)
+    symbols: list[Symbol] = field(default_factory=list)
 
-    def add_section(self, name, data, align=1, flags="AX"):
-        self.sections[name] = Section(name, data, align, flags)
+    def add_section(self, name: str, data: bytes = b'', align: int = 4) -> Section:
+        sec = Section(name, bytearray(data), align)
+        self.sections[name] = sec
+        return sec
 
-    def add_symbol(self, name, section="", offset=0, binding="global", defined=True):
-        sym = Symbol(name, section, offset, binding=binding, defined=defined)
+    def add_symbol(self, name: str, section: str, offset: int = 0,
+                   is_global: bool = True, size: int = 0) -> Symbol:
+        sym = Symbol(name, section, offset, size, is_global, section != 'UNDEF')
         self.symbols.append(sym)
         return sym
 
-    def add_relocation(self, section, offset, symbol, rtype="R_X86_64_PC32"):
-        self.relocations[section].append(Relocation(offset, symbol, rtype))
+    def add_reloc(self, section: str, offset: int, symbol: str,
+                  rtype: str = 'ABS32', addend: int = 0):
+        self.sections[section].relocations.append(
+            Relocation(offset, symbol, rtype, addend))
+
+
+@dataclass
+class LinkedOutput:
+    sections: dict[str, bytearray]
+    symbols: dict[str, int]  # name → address
+    entry: int = 0
+    base: int = 0x400000
+
 
 class Linker:
-    def __init__(self):
-        self.objects = []
-        self.global_symbols = {}  # name -> (object, Symbol)
-        self.merged_sections = defaultdict(bytearray)
-        self.section_offsets = {}  # (obj_name, section) -> offset in merged
-        self.output_symbols = {}
-        self.errors = []
+    """Static linker: merge sections, resolve symbols, apply relocations."""
 
-    def add_object(self, obj):
+    def __init__(self, base_addr: int = 0x400000):
+        self.base = base_addr
+        self.objects: list[ObjectFile] = []
+
+    def add(self, obj: ObjectFile):
         self.objects.append(obj)
 
-    def resolve_symbols(self):
-        """Phase 1: Build global symbol table."""
-        undefined = set()
+    def link(self, entry: str = 'main') -> LinkedOutput:
+        # Phase 1: Merge sections
+        merged: dict[str, bytearray] = {}
+        section_bases: dict[str, int] = {}
+        # Track where each object's section lands in merged output
+        obj_section_offsets: list[dict[str, int]] = []
+
+        current_addr = self.base
+        for sec_name in ['.text', '.data', '.bss']:
+            section_bases[sec_name] = current_addr
+            merged[sec_name] = bytearray()
+            for obj in self.objects:
+                if sec_name not in obj.sections:
+                    continue
+                sec = obj.sections[sec_name]
+                # Align
+                pad = (sec.align - len(merged[sec_name]) % sec.align) % sec.align
+                merged[sec_name].extend(b'\x00' * pad)
+            current_addr += max(len(merged.get(sec_name, b'')), 0)
+
+        # Re-merge with offset tracking
+        merged = {}
+        obj_section_offsets = []
+        current_addr = self.base
+        for sec_name in ['.text', '.data', '.bss']:
+            section_bases[sec_name] = current_addr
+            merged[sec_name] = bytearray()
+            for i, obj in enumerate(self.objects):
+                if i >= len(obj_section_offsets):
+                    obj_section_offsets.append({})
+                if sec_name not in obj.sections:
+                    continue
+                sec = obj.sections[sec_name]
+                pad = (sec.align - len(merged[sec_name]) % sec.align) % sec.align
+                merged[sec_name].extend(b'\x00' * pad)
+                obj_section_offsets[i][sec_name] = len(merged[sec_name])
+                merged[sec_name].extend(sec.data)
+            current_addr = section_bases[sec_name] + len(merged[sec_name])
+
+        # Phase 2: Build global symbol table
+        global_syms: dict[str, int] = {}
+        for i, obj in enumerate(self.objects):
+            for sym in obj.symbols:
+                if not sym.is_global or not sym.defined:
+                    continue
+                addr = section_bases.get(sym.section, 0) + obj_section_offsets[i].get(sym.section, 0) + sym.offset
+                if sym.name in global_syms:
+                    raise LinkError(f"Duplicate symbol: {sym.name} (in {obj.name})")
+                global_syms[sym.name] = addr
+
+        # Phase 3: Check for undefined symbols
         for obj in self.objects:
             for sym in obj.symbols:
-                if not sym.defined:
-                    undefined.add(sym.name)
+                if not sym.defined and sym.name not in global_syms:
+                    raise LinkError(f"Undefined symbol: {sym.name} (referenced in {obj.name})")
+
+        # Phase 4: Apply relocations
+        for i, obj in enumerate(self.objects):
+            for sec_name, sec in obj.sections.items():
+                if sec_name not in merged:
                     continue
-                if sym.binding == "local":
-                    continue
-                if sym.name in self.global_symbols:
-                    existing_obj, existing = self.global_symbols[sym.name]
-                    if existing.binding == "weak" and sym.binding == "global":
-                        self.global_symbols[sym.name] = (obj, sym)
-                    elif sym.binding != "weak":
-                        self.errors.append(f"duplicate symbol: {sym.name} (in {existing_obj.name} and {obj.name})")
-                else:
-                    self.global_symbols[sym.name] = (obj, sym)
-        # Check for unresolved
-        for name in undefined:
-            if name not in self.global_symbols:
-                self.errors.append(f"undefined symbol: {name}")
-        return len(self.errors) == 0
+                base_offset = obj_section_offsets[i].get(sec_name, 0)
+                for reloc in sec.relocations:
+                    target_addr = global_syms.get(reloc.symbol)
+                    if target_addr is None:
+                        raise LinkError(f"Undefined relocation target: {reloc.symbol}")
+                    patch_offset = base_offset + reloc.offset
+                    if reloc.type == 'ABS32':
+                        val = (target_addr + reloc.addend) & 0xFFFFFFFF
+                        merged[sec_name][patch_offset:patch_offset+4] = val.to_bytes(4, 'little')
+                    elif reloc.type == 'REL32':
+                        pc = section_bases[sec_name] + patch_offset + 4
+                        val = (target_addr + reloc.addend - pc) & 0xFFFFFFFF
+                        merged[sec_name][patch_offset:patch_offset+4] = val.to_bytes(4, 'little')
 
-    def merge_sections(self):
-        """Phase 2: Merge sections from all objects."""
-        for obj in self.objects:
-            for sec_name, section in obj.sections.items():
-                merged = self.merged_sections[sec_name]
-                # Align
-                padding = (section.align - len(merged) % section.align) % section.align
-                merged.extend(b'\x00' * padding)
-                self.section_offsets[(obj.name, sec_name)] = len(merged)
-                merged.extend(section.data)
+        entry_addr = global_syms.get(entry, self.base)
+        return LinkedOutput(merged, global_syms, entry_addr, self.base)
 
-    def relocate(self):
-        """Phase 3: Apply relocations."""
-        relocations_applied = 0
-        for obj in self.objects:
-            for sec_name, relocs in obj.relocations.items():
-                base = self.section_offsets.get((obj.name, sec_name), 0)
-                for reloc in relocs:
-                    if reloc.symbol not in self.global_symbols:
-                        continue
-                    target_obj, target_sym = self.global_symbols[reloc.symbol]
-                    target_base = self.section_offsets.get((target_obj.name, target_sym.section), 0)
-                    target_addr = target_base + target_sym.offset
-                    patch_offset = base + reloc.offset
-                    # Simplified: just store the resolved address
-                    self.output_symbols[reloc.symbol] = target_addr
-                    relocations_applied += 1
-        return relocations_applied
 
-    def link(self):
-        print("Phase 1: Symbol resolution")
-        ok = self.resolve_symbols()
-        for e in self.errors:
-            print(f"  ERROR: {e}")
-        if not ok:
-            return False
-        print(f"  {len(self.global_symbols)} global symbols resolved ✓")
+class LinkError(Exception):
+    pass
 
-        print("Phase 2: Section merging")
-        self.merge_sections()
-        for name, data in self.merged_sections.items():
-            print(f"  {name}: {len(data)} bytes")
 
-        print("Phase 3: Relocation")
-        n = self.relocate()
-        print(f"  {n} relocations applied ✓")
-        return True
+def demo():
+    print("=== Static Linker ===\n")
 
-def main():
-    # Create object files
+    # Object file 1: main.o
     main_o = ObjectFile("main.o")
-    main_o.add_section(".text", b'\x55\x48\x89\xe5' + b'\xe8\x00\x00\x00\x00' + b'\xc3', align=16, flags="AX")
-    main_o.add_symbol("main", ".text", 0)
-    main_o.add_symbol("printf", defined=False)
-    main_o.add_relocation(".text", 5, "printf")
+    text = main_o.add_section('.text', bytes(20))
+    main_o.add_symbol('main', '.text', 0)
+    main_o.add_symbol('printf', 'UNDEF', is_global=True)
+    main_o.add_reloc('.text', 8, 'printf', 'REL32')
+    main_o.add_reloc('.text', 14, 'helper', 'REL32')
 
-    lib_o = ObjectFile("lib.o")
-    lib_o.add_section(".text", b'\x55\x48\x89\xe5' + b'\x31\xc0\xc3', align=16, flags="AX")
-    lib_o.add_section(".data", b'\x48\x65\x6c\x6c\x6f\x00', align=8, flags="WA")
-    lib_o.add_symbol("printf", ".text", 0)
-    lib_o.add_symbol("message", ".data", 0)
+    # Object file 2: helper.o
+    helper_o = ObjectFile("helper.o")
+    text2 = helper_o.add_section('.text', bytes(16))
+    data2 = helper_o.add_section('.data', b'Hello, World!\x00')
+    helper_o.add_symbol('helper', '.text', 0)
+    helper_o.add_symbol('greeting', '.data', 0)
+    helper_o.add_symbol('printf', 'UNDEF', is_global=True)
 
-    utils_o = ObjectFile("utils.o")
-    utils_o.add_section(".text", b'\x55\x48\x89\xe5\xc3', align=16)
-    utils_o.add_symbol("helper", ".text", 0, binding="weak")
+    # "libc": printf.o
+    libc = ObjectFile("printf.o")
+    libc.add_section('.text', bytes(32))
+    libc.add_symbol('printf', '.text', 0)
 
-    print("=== Linker Simulation ===\n")
-    linker = Linker()
-    linker.add_object(main_o)
-    linker.add_object(lib_o)
-    linker.add_object(utils_o)
-    
-    ok = linker.link()
-    print(f"\nLink {'succeeded' if ok else 'FAILED'}")
-    print(f"\nSymbol table:")
-    for name, (obj, sym) in sorted(linker.global_symbols.items()):
-        addr = linker.output_symbols.get(name, linker.section_offsets.get((obj.name, sym.section), 0) + sym.offset)
-        print(f"  0x{addr:08x} {sym.binding:6s} {name}")
+    linker = Linker(0x400000)
+    linker.add(main_o)
+    linker.add(helper_o)
+    linker.add(libc)
 
-if __name__ == "__main__":
-    main()
+    output = linker.link('main')
+
+    print(f"Entry point: 0x{output.entry:x}")
+    print(f"\nSymbols:")
+    for name, addr in sorted(output.symbols.items(), key=lambda x: x[1]):
+        print(f"  0x{addr:08x}  {name}")
+    print(f"\nSections:")
+    for name, data in output.sections.items():
+        print(f"  {name:8s}  {len(data):5d} bytes  base=0x{output.base:x}")
+
+
+if __name__ == '__main__':
+    if '--test' in sys.argv:
+        # Basic linking
+        a = ObjectFile("a.o")
+        a.add_section('.text', bytes(8))
+        a.add_symbol('main', '.text', 0)
+        a.add_symbol('foo', 'UNDEF')
+        a.add_reloc('.text', 0, 'foo', 'ABS32')
+
+        b = ObjectFile("b.o")
+        b.add_section('.text', bytes(8))
+        b.add_symbol('foo', '.text', 0)
+
+        l = Linker(0x1000)
+        l.add(a); l.add(b)
+        out = l.link('main')
+        assert 'main' in out.symbols
+        assert 'foo' in out.symbols
+        assert out.entry == out.symbols['main']
+        # Relocation applied
+        patched = int.from_bytes(out.sections['.text'][0:4], 'little')
+        assert patched == out.symbols['foo']
+        # Duplicate symbol
+        c = ObjectFile("c.o")
+        c.add_section('.text', bytes(4))
+        c.add_symbol('foo', '.text', 0)
+        l2 = Linker(); l2.add(b); l2.add(c)
+        try: l2.link(); assert False
+        except LinkError: pass
+        # Undefined symbol
+        d = ObjectFile("d.o")
+        d.add_section('.text', bytes(4))
+        d.add_symbol('missing', 'UNDEF')
+        l3 = Linker(); l3.add(d)
+        try: l3.link(); assert False
+        except LinkError: pass
+        print("All tests passed ✓")
+    else:
+        demo()
